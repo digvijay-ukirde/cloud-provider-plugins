@@ -10,4 +10,4 @@ homeDir="$(cd "$scriptDir" && cd .. && pwd)"
 
 export PYTHONPATH=$scriptDir
 
-python3 $scriptDir/nextgen_request_machines.py $inJson $homeDir
+python3 $scriptDir/aws_request_machines.py $inJson $homeDir

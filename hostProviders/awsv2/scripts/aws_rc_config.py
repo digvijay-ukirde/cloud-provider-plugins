@@ -13,81 +13,10 @@
 # limitations under the License.
 
 import json
-import logging
-from logging.handlers import RotatingFileHandler
-import os, socket
-import sys
+import os
 from typing import Optional, Dict, Any
-from os import path
+import logging
 
-global log_file
-
-def load_json_file(file_path: str) -> Optional[dict]:
-    """Load and parse a JSON file safely.
-    
-    Args:
-        file_path: Path to the JSON file.
-    
-    Returns:
-        Parsed JSON data as a dict, or None if file is invalid/missing.
-    """
-    try:
-        with open(file_path, 'r', encoding='utf-8') as file:
-            return json.load(file)
-    except (FileNotFoundError, PermissionError) as e:
-        logging.error(f"File access error: {str(e)}")
-    except json.JSONDecodeError as e:
-        logging.error(f"Invalid JSON: {str(e)}")
-    except Exception as e:
-        logging.error(f"Unexpected error: {str(e)}")
-    return None
-  
-
-def set_rc_logger() -> None:
-    """Configure the root logger with settings from config and environment."""
-    config, _ = get_aws_configs()
-    
-    # Convert log level string to logging level
-    log_level = getattr(logging, config.log_level.upper(), logging.INFO)
-    
-    # Validate and get log directory
-    try:
-        log_dirname = os.environ["PRO_LSF_LOGDIR"]
-    except KeyError:
-        sys.exit("Error: The PRO_LSF_LOGDIR environment variable is not set")
-    
-    # Get provider name with default fallback
-    provider_name = os.getenv("PROVIDER_NAME", "aws")
-    
-    # Clear existing handlers
-    for handler in logging.root.handlers[:]:
-        logging.root.removeHandler(handler)
-    
-    # Configure logging
-    log_format = '[%(asctime)s] {%(filename)s:%(lineno)d} %(levelname)s - %(message)s'
-    date_format = '%m-%d %H:%M:%S'
-    
-    if log_dirname:
-        host_name = socket.gethostname()
-        log_file = f"{log_dirname}/{provider_name}-provider.log.{host_name}"
-        os.makedirs(os.path.dirname(log_file), exist_ok=True)
-        handler = RotatingFileHandler(
-            log_file,
-            maxBytes=2_097_152,
-            backupCount=5
-        )
-        logging.basicConfig(
-            handlers=[handler],
-            level=log_level,
-            format=log_format,
-            datefmt=date_format
-        )
-    else:
-        logging.basicConfig(
-            level=log_level,
-            format=log_format,
-            datefmt=date_format
-        )
 
 class AWSConfig:
     """Handles configuration for the aws configs defined in awsprov_config.json.
@@ -152,36 +81,47 @@ class AWSTemplate:
       TBD
 
     """
-    def __init__(self, template_data: Dict[str, Any]) -> None:
+    def __init__(self, template_data: Dict[str, Any], template_id: str) -> None:
         """Initialize configuration from JSON content.
 
-          Args:
-            content (dict): A dictionary containing configuration values.
+        Args:
+            template_data (dict): A dictionary containing template configuration values.
+            template_id (str): The ID of the template to use from the data.
         """
+        # Find the specific template by ID
+        templates = template_data.get("templates", [])
+        template = None
+        for t in templates:
+            if t.get("templateId") == template_id:
+                template = t
+                break
+        
+        if not template:
+            raise ValueError(f"Template with ID '{template_id}' not found")
 
-        self.templateId = template_data.get("templateId", "")
-        self.maxNumber = template_data.get("maxNumber", 0)
-        self.imageId = template_data.get("imageId", "")
-        self.subnetId = template_data.get("subnetId", "")
-        self.vmType = template_data.get("vmType", "")
-        self.vmNumber = template_data.get("vmNumber", 0)
-        self.ttl = template_data.get("ttl", 0)
-        self.keyName = template_data.get("keyName", "")
-        self.sgIds = template_data.get("sgIds", "")
-        self.userData = template_data.get("userData", "")
-        self.userDataObj = template_data.get("userDataObj", "")
-        self.pGrpName = template_data.get("pGrpName", "")
-        self.instanceProfile = template_data.get("instanceProfile", "")
-        self.ebsOptimized = template_data.get("ebsOptimized", false)
-        self.priority = template_data.get("priority", 0)
-        self.tenancy = template_data.get("tenancy", "")
-        self.interfaceType = template_data.get("interfaceType", "")
-        self.efaCount = template_data.get("efaCount", "")
-        self.launchTemplateId = template_data.get("launchTemplateId", "")
-        self.launchTemplateVersion = template_data.get("launchTemplateVersion", "")    
-        self.marketSpotPrice = template_data.get("marketSpotPrice", "")
-        self.ec2FleetConfig = template_data.get("ec2FleetConfig", "")
-        self.onDemandTargetCapacityRatio = template_data.get("onDemandTargetCapacityRatio", "")
+        self.templateId = template.get("templateId", "")
+        self.maxNumber = template.get("maxNumber", 0)
+        self.imageId = template.get("imageId", "")
+        self.subnetId = template.get("subnetId", "")
+        self.vmType = template.get("vmType", "")
+        self.vmNumber = template.get("vmNumber", 0)
+        self.ttl = template.get("ttl", 0)
+        self.keyName = template.get("keyName", "")
+        self.SecurityGroupIds = template.get("SecurityGroupIds", "")
+        self.userData = template.get("userData", "")
+        self.userDataObj = template.get("userDataObj", "")
+        self.pGrpName = template.get("pGrpName", "")
+        self.instanceProfile = template.get("instanceProfile", "")
+        self.ebsOptimized = template.get("ebsOptimized", False)
+        self.priority = template.get("priority", 0)
+        self.tenancy = template.get("tenancy", "")
+        self.interfaceType = template.get("interfaceType", "")
+        self.efaCount = template.get("efaCount", "")
+        self.launchTemplateId = template.get("launchTemplateId", "")
+        self.launchTemplateVersion = template.get("launchTemplateVersion", "")    
+        self.marketSpotPrice = template.get("marketSpotPrice", "")
+        self.ec2FleetConfig = template.get("ec2FleetConfig", "")
+        self.onDemandTargetCapacityRatio = template.get("onDemandTargetCapacityRatio", "")
 
 
     def __str__(self) -> str:
@@ -194,7 +134,7 @@ class AWSTemplate:
             f"vmNumber: {self.vmNumber}\n"
             f"ttl: {self.ttl}\n"
             f"keyName: {self.keyName}\n"
-            f"sgIds: {self.sgIds}\n"
+            f"SecurityGroupIds: {self.SecurityGroupIds}\n"
             f"userData: {self.userData}\n"
             f"userDataObj: {self.userDataObj}\n"
             f"pGrpName: {self.pGrpName}\n"
@@ -211,14 +151,15 @@ class AWSTemplate:
             f"onDemandTargetCapacityRatio: {self.onDemandTargetCapacityRatio}\n"
         )
 
-def get_aws_configs(template_id: str = "") -> tuple[AWSConfig, Optional[AWSTemplate]]:
+
+def get_aws_configs():
     """Load and return AWS configuration and template.
     
     Args:
         template_id: ID of the template to load. If empty, no template is loaded.
     
     Returns:
-        Tuple of (AWSConfig, AWSTemplate). Template may be None.
+        Dict of AWSConfig
     
     Raises:
         EnvironmentError: If required env vars or files are missing.
@@ -231,48 +172,71 @@ def get_aws_configs(template_id: str = "") -> tuple[AWSConfig, Optional[AWSTempl
 
     # Validate files exist first
     config_path = os.path.join(conf_dir, "conf", "awsprov_config.json")
-    template_path = os.path.join(conf_dir, "conf", "awsprov_templates.json")
     
     if not os.path.exists(config_path):
         raise FileNotFoundError(f"Config file not found: {config_path}")
-    if template_id and not os.path.exists(template_path):
-        raise FileNotFoundError(f"Template file not found: {template_path}")
 
     # Load config
     with open(config_path, "r", encoding="utf-8") as config_file:
-        config = AWSConfig(json.load(config_file))
+        config = json.load(config_file)
+    return config
+
+    
+def get_aws_template(template_id: str = ""):
+    """Load and return AWS configuration and template.
+    
+    Args:
+        template_id: ID of the template to load. If empty, no template is loaded.
+    
+    Returns:
+        Dict of AWSTemplate. Template may be None.
+    
+    Raises:
+        EnvironmentError: If required env vars or files are missing.
+        JSONDecodeError: If config files contain invalid JSON.
+    """
+    try:
+        conf_dir = os.environ["PRO_CONF_DIR"]
+    except KeyError:
+        raise EnvironmentError("PRO_CONF_DIR environment variable is not set")
+
+    # Validate files exist first
+    template_path = os.path.join(conf_dir, "conf", "awsprov_templates.json")
+    
+    if not os.path.exists(template_path):
+        raise FileNotFoundError(f"Template file not found: {template_path}")
 
     # Load template if ID provided
     template = None
     if template_id:
         with open(template_path, "r", encoding="utf-8") as template_file:
-            template_data = json.load(template_file)
-            template = AWSTemplate(template_data, template_id)
-        logging.debug("Loaded template in get_aws_configs: %s", template_id)
-
-    return config, template
+            templates = json.load(template_file)
+            
+        for template in templates.get("templates", []):
+            if template.get("templateId") == template_id:
+                return template
+    return template
 
 
 def main() -> None:
     """Main function to load and validate configuration and templates."""
     # Load config
-    config_data = load_json_file("conf/awsprov_config.json")
-    if not config_data:
+    config = get_aws_configs()
+    config_obj = AWSConfig(config)
+    if not config_obj:
         logging.critical("Failed to load config file. Exiting.")
         return
-
-    config_obj = AWSConfig(config_data)
     print(config_obj)
 
     # Load template
-    template_data = load_json_file("conf/awsprov_templates.json")
-    if not template_data:
+    template = get_aws_template("template-01")
+    template_obj = AWSTemplate(template, "template-01")
+    if not template_obj:
         logging.critical("Failed to load template file. Exiting.")
         return
 
-    template_obj = AWSTemplate(template_data, "CENTOS-Template-NGVM-1")
     print(template_obj)
 
 if __name__ == "__main__":
-  logging.basicConfig(level=logging.DEBUG)
-  main()
+    logging.basicConfig(level=logging.DEBUG)
+    main()
