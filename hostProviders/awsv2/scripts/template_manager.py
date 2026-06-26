@@ -270,9 +270,11 @@ class TemplateManager:
                 errors.append(f"Template '{template_id}': launchTemplateVersion must be a string")
             elif version not in ['$Latest', '$Default']:
                 try:
-                    float(version)
+                    int_v = int(version)
+                    if int_v <= 0:
+                        raise ValueError()
                 except ValueError:
-                    errors.append(f"Template '{template_id}': launchTemplateVersion must be '$Latest', '$Default', or a version number")
+                    errors.append(f"Template '{template_id}': launchTemplateVersion must be '$Latest', '$Default', or a positive integer version number")
         
         # Validate fleetRole
         if 'fleetRole' in template:

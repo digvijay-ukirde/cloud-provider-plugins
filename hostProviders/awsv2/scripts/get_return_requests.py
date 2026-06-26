@@ -41,13 +41,13 @@ def main():
         sys.exit(0)
         
     except Exception as e:
-        logger.error(f"Error in requestReturnMachines: {e}")
+        logger.error(f"Error in getReturnRequests: {e}")
         error_output = {
             "requests": [],
             "status": "complete",
             "message": str(e)
         }
-        write_output_json({"error": str(e)})
+        write_output_json(error_output)
         sys.exit(1)
 
 if __name__ == "__main__":

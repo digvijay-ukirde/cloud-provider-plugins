@@ -22,7 +22,6 @@ from typing import Dict, List, Any, Optional, Tuple
 import logging
 from datetime import datetime
 from contextlib import contextmanager
-from collections import defaultdict
 
 logger = logging.getLogger(__name__)
 
@@ -94,6 +93,7 @@ class DBManager:
         lock_acquired = False
         max_attempts = 10
         attempt = 0
+        stale_removed = False  # allow at most one stale-lock removal to prevent infinite loop
         
         while not lock_acquired and attempt < max_attempts:
             try:
@@ -109,14 +109,17 @@ class DBManager:
                     time.sleep(0.1 * attempt)
                 else:
                     logger.warning(f"Could not acquire lock after {max_attempts} attempts")
-                    # Check if lock is stale (older than 30 seconds)
-                    try:
-                        lock_age = time.time() - os.path.getmtime(lock_file)
-                        if lock_age > 30:
-                            logger.warning(f"Removing stale lock file (age: {lock_age}s)")
-                            os.remove(lock_file)
-                    except:
-                        pass
+                    # Check if lock is stale (older than 30 seconds) — only attempt once
+                    if not stale_removed:
+                        try:
+                            lock_age = time.time() - os.path.getmtime(lock_file)
+                            if lock_age > 30:
+                                logger.warning(f"Removing stale lock file (age: {lock_age}s)")
+                                os.remove(lock_file)
+                                stale_removed = True
+                                attempt = 0  # retry after removal
+                        except OSError as e:
+                            logger.warning(f"Could not remove stale lock file: {e}")
         
         try:
             yield lock_acquired
@@ -171,29 +174,29 @@ class DBManager:
 
     def _read_data(self) -> Dict[str, Any]:
         """Read data from the database file"""
-        with self._lock:
-            # Use file lock for reading to prevent read during write
-            with self._file_lock_context() as lock_acquired:
-                if not lock_acquired:
-                    logger.warning("Could not acquire lock for reading, using empty structure")
-                    return {"requests": []}
-                
-                # Try to read the main file
-                primary_data = self._read_file_safe(self.db_file)
-                if primary_data is not None:
-                    return primary_data.copy()
-                
-                # If primary file failed, try backup
-                logger.warning("Primary database file read failed, trying backup...")
-                backup_data = self._read_file_safe(self.backup_file)
-                if backup_data is not None:
-                    # Restore backup to primary
-                    self._atomic_write(self.db_file, backup_data, backup=False)
-                    return backup_data.copy()
-                
-                # Both failed, return empty structure
-                logger.error("Both primary and backup database files are corrupted or unavailable")
+        # File lock alone is sufficient for cross-process mutual exclusion.
+        # Do NOT hold self._lock while waiting for the file lock
+        with self._file_lock_context() as lock_acquired:
+            if not lock_acquired:
+                logger.warning("Could not acquire lock for reading, using empty structure")
                 return {"requests": []}
+            
+            # Try to read the main file
+            primary_data = self._read_file_safe(self.db_file)
+            if primary_data is not None:
+                return primary_data.copy()
+            
+            # If primary file failed, try backup
+            logger.warning("Primary database file read failed, trying backup...")
+            backup_data = self._read_file_safe(self.backup_file)
+            if backup_data is not None:
+                # Restore backup to primary
+                self._atomic_write(self.db_file, backup_data, backup=False)
+                return backup_data.copy()
+            
+            # Both failed, return empty structure
+            logger.error("Both primary and backup database files are corrupted or unavailable")
+            return {"requests": []}
 
     def _read_file_safe(self, filepath: str) -> Optional[Dict[str, Any]]:
         """Safely read and validate JSON file"""
@@ -237,8 +240,8 @@ class DBManager:
 
     def _write_data(self, data: Dict[str, Any]):
         """Write data to the database file with full error handling"""
+        # Validate cheaply with the in-process lock before touching the file system.
         with self._lock:
-            # Validate data structure before writing
             if not isinstance(data, dict):
                 logger.error(f"Cannot write invalid data: root is not a dict")
                 return
@@ -250,90 +253,67 @@ class DBManager:
             if not isinstance(data['requests'], list):
                 logger.error(f"Cannot write invalid data: 'requests' is not a list")
                 return
+
+        # File lock is acquired outside self._lock so that other threads are not
+        # blocked behind the RLock while this process waits for cross-process I/O.
+        with self._file_lock_context() as lock_acquired:
+            if not lock_acquired:
+                logger.error("Could not acquire lock for writing")
+                return
             
-            # Use file lock for writing
-            with self._file_lock_context() as lock_acquired:
-                if not lock_acquired:
-                    logger.error("Could not acquire lock for writing")
-                    return
-                
-                # Create backup of current file
-                if os.path.exists(self.db_file):
-                    try:
-                        current_data = self._read_file_safe(self.db_file)
-                        if current_data:
-                            self._atomic_write(self.backup_file, current_data)
-                            logger.debug("Created backup before write")
-                    except Exception as e:
-                        logger.warning(f"Failed to create backup: {e}")
-                
-                # Write new data
-                if self._atomic_write(self.db_file, data, backup=False):
-                    logger.debug("Successfully wrote data to database")
-                else:
-                    logger.error("Failed to write data")
-                    # Try to restore from backup if write failed
-                    self._restore_from_backup()
+            # Create backup of current file
+            if os.path.exists(self.db_file):
+                try:
+                    current_data = self._read_file_safe(self.db_file)
+                    if current_data:
+                        self._atomic_write(self.backup_file, current_data)
+                        logger.debug("Created backup before write")
+                except Exception as e:
+                    logger.warning(f"Failed to create backup: {e}")
+            
+            # Write new data
+            if self._atomic_write(self.db_file, data, backup=False):
+                logger.debug("Successfully wrote data to database")
+            else:
+                logger.error("Failed to write data")
+                # Try to restore from backup if write failed
+                self._restore_from_backup()
                     
     def _attempt_json_recovery(self, filepath: str) -> Optional[Dict[str, Any]]:
         """Attempt to recover corrupted JSON file"""
         try:
             with open(filepath, 'r') as f:
                 content = f.read()
-            
-            # Try to find and extract valid JSON
-            # Look for complete requests array
+
+            # Locate the start of our known root object pattern
             start_idx = content.find('{"requests": [')
             if start_idx == -1:
+                # Also try the pretty-printed variation produced by json.dump(indent=2)
+                start_idx = content.find('{\n  "requests": [')
+            if start_idx == -1:
                 return None
-                
-            # Find matching closing bracket
-            bracket_count = 0
-            in_string = False
-            escape = False
-            
-            for i in range(start_idx, len(content)):
-                char = content[i]
-                
-                if escape:
-                    escape = False
-                    continue
-                    
-                if char == '\\':
-                    escape = True
-                    continue
-                    
-                if char == '"':
-                    in_string = not in_string
-                    continue
-                    
-                if not in_string:
-                    if char == '[':
-                        bracket_count += 1
-                    elif char == ']':
-                        bracket_count -= 1
-                        if bracket_count == 0:
-                            # Found complete array
-                            end_idx = i + 1
-                            try:
-                                partial_json = content[start_idx:end_idx] + '}'
-                                data = json.loads(partial_json)
-                                logger.info(f"Recovered partial JSON from {filepath}")
-                                return data
-                            except json.JSONDecodeError:
-                                # Try to find closing brace
-                                if content.find('}', end_idx) != -1:
-                                    end_idx = content.find('}', end_idx) + 1
-                                    try:
-                                        partial_json = content[start_idx:end_idx]
-                                        data = json.loads(partial_json)
-                                        logger.info(f"Recovered partial JSON from {filepath}")
-                                        return data
-                                    except json.JSONDecodeError:
-                                        pass
-                            
-            return None
-            
+
+            # raw_decode() parses the longest valid JSON value starting at
+            # start_idx and ignores any trailing garbage — exactly what we need
+            # for a file truncated mid-write.
+            decoder = json.JSONDecoder()
+            try:
+                data, _ = decoder.raw_decode(content, start_idx)
+            except json.JSONDecodeError as e:
+                logger.debug(f"raw_decode failed for {filepath}: {e}")
+                return None
+
+            # Validate the recovered structure
+            if not isinstance(data, dict) or 'requests' not in data:
+                logger.debug(f"Recovered JSON from {filepath} has invalid structure")
+                return None
+            if not isinstance(data['requests'], list):
+                logger.debug(f"Recovered JSON from {filepath}: 'requests' is not a list")
+                return None
+
+            logger.info(f"Recovered partial JSON from {filepath} ({len(data['requests'])} requests)")
+            return data
+
         except Exception as e:
             logger.error(f"Failed to recover JSON from {filepath}: {e}")
             return None
@@ -401,92 +381,108 @@ class DBManager:
     def add_machines_to_request(self, request_id: str, machines_data: List[Dict[str, Any]]) -> Dict[str, Any]:
         """
         Batch add multiple machines to a request in a single operation.
-        
+
+        The read and write are performed under a single file lock acquisition so
+        that concurrent callers in separate processes cannot both read an empty
+        machine list, both pass the duplicate check, and both write the same
+        instances.  self._lock serialises callers within the same process;
+        the file lock serialises callers across processes.
+
         Returns: Dict with 'success_count', 'failed_count', and 'errors' list
         """
         if not machines_data:
             return {'success_count': 0, 'failed_count': 0, 'errors': []}
-            
+
         with self._lock:
-            try:
-                data = self._read_data()
-                
-                # Find the request
-                target_request = None
-                for request in data['requests']:
-                    if request['requestId'] == request_id:
-                        target_request = request
-                        break
-                
-                # Try legacy fallback if not found
-                if not target_request:
-                    for request in data['requests']:
-                        for machine in request.get('machines', []):
-                            if machine.get('machineId') in [m.get('machineId') for m in machines_data]:
-                                target_request = request
-                                break
-                        if target_request:
-                            break
-                
-                if not target_request:
+            with self._file_lock_context() as lock_acquired:
+                if not lock_acquired:
+                    logger.error("add_machines_to_request: could not acquire file lock")
                     return {
                         'success_count': 0,
                         'failed_count': len(machines_data),
-                        'errors': [f"Request {request_id} not found"]
+                        'errors': ["Could not acquire file lock"]
                     }
-                
-                # Initialize machines list if not exists
-                if 'machines' not in target_request:
-                    target_request['machines'] = []
-                
-                # Create set of existing machine IDs for fast lookup
-                existing_ids = {m['machineId'] for m in target_request['machines']}
-                
-                # Add machines in batch
-                success_count = 0
-                failed_count = 0
-                errors = []
-                
-                for i, machine_data in enumerate(machines_data):
-                    try:
-                        machine_id = machine_data.get('machineId')
-                        
-                        if not machine_id:
-                            errors.append(f"Machine {i}: Missing machineId")
+
+                try:
+                    # Read inside the held file lock — no other process can write between
+                    # this read and the write below.
+                    data = self._read_file_safe(self.db_file) or {"requests": []}
+
+                    # Find the request
+                    target_request = None
+                    for request in data['requests']:
+                        if request['requestId'] == request_id:
+                            target_request = request
+                            break
+
+                    # Try legacy fallback if not found
+                    if not target_request:
+                        for request in data['requests']:
+                            for machine in request.get('machines', []):
+                                if machine.get('machineId') in [m.get('machineId') for m in machines_data]:
+                                    target_request = request
+                                    break
+                            if target_request:
+                                break
+
+                    if not target_request:
+                        return {
+                            'success_count': 0,
+                            'failed_count': len(machines_data),
+                            'errors': [f"Request {request_id} not found"]
+                        }
+
+                    # Initialize machines list if not exists
+                    if 'machines' not in target_request:
+                        target_request['machines'] = []
+
+                    # Create set of existing machine IDs for fast lookup
+                    existing_ids = {m['machineId'] for m in target_request['machines']}
+
+                    # Add machines in batch
+                    success_count = 0
+                    failed_count = 0
+                    errors = []
+
+                    for i, machine_data in enumerate(machines_data):
+                        try:
+                            machine_id = machine_data.get('machineId')
+
+                            if not machine_id:
+                                errors.append(f"Machine {i}: Missing machineId")
+                                failed_count += 1
+                                continue
+
+                            if machine_id in existing_ids:
+                                failed_count += 1
+                                continue
+
+                            target_request['machines'].append(machine_data)
+                            existing_ids.add(machine_id)
+                            success_count += 1
+
+                        except Exception as e:
+                            errors.append(f"Machine {i}: {str(e)}")
                             failed_count += 1
-                            continue
-                        
-                        if machine_id in existing_ids:
-                            errors.append(f"Machine {i}: Machine {machine_id} already exists")
-                            failed_count += 1
-                            continue
-                        
-                        target_request['machines'].append(machine_data)
-                        existing_ids.add(machine_id)
-                        success_count += 1
-                        
-                    except Exception as e:
-                        errors.append(f"Machine {i}: {str(e)}")
-                        failed_count += 1
-                
-                # Write back only if we have successful additions
-                if success_count > 0:
-                    self._write_data(data)
-                    logger.debug(f"Batch added {success_count} machines to request {request_id}")
-                
-                return {
-                    'success_count': success_count,
-                    'failed_count': failed_count,
-                    'errors': errors[:10]
-                }
-                
-            except Exception as e:
-                logger.error(f"Error in add_machines_to_request: {e}")
-                return {
-                    'success_count': 0,
-                    'failed_count': len(machines_data),
-                    'errors': [str(e)]
-                }
+
+                    # Write back only if we have successful additions
+                    if success_count > 0:
+                        self._atomic_write(self.db_file, data, backup=False)
+                        logger.debug(f"Batch added {success_count} machines to request {request_id}")
+
+                    return {
+                        'success_count': success_count,
+                        'failed_count': failed_count,
+                        'errors': errors[:10]
+                    }
+
+                except Exception as e:
+                    logger.error(f"Error in add_machines_to_request: {e}")
+                    return {
+                        'success_count': 0,
+                        'failed_count': len(machines_data),
+                        'errors': [str(e)]
+                    }
 
     def update_machines(self, updates: List[Dict[str, Any]]) -> Dict[str, Any]:
         """
@@ -505,186 +501,217 @@ class DBManager:
         - name: Optional[str] = None
         - lifecycle: Optional[str] = None
         - tag_instance_id: Optional[bool] = None
+        - ncores: Optional[int] = None
+        - nthreads: Optional[int] = None
         
         Returns: Dict with 'success_count', 'failed_count', and 'errors' list
         """
         if not updates:
             return {'success_count': 0, 'failed_count': 0, 'errors': []}
-            
+
         with self._lock:
-            try:
-                data = self._read_data()
-                
-                # Group machines by request_id for faster lookup
-                request_map = {}
-                machine_map = {}
-                for request in data['requests']:
-                    request_map[request['requestId']] = request
-                    for machine in request.get('machines', []):
-                        machine_map[(request['requestId'], machine['machineId'])] = machine
-                
-                # Process updates
-                success_count = 0
-                failed_count = 0
-                errors = []
-                
-                for i, update in enumerate(updates):
-                    try:
-                        request_id = update.get('request_id')
-                        machine_id = update.get('machine_id')
-                        
-                        if not request_id or not machine_id:
-                            errors.append(f"Update {i}: Missing request_id or machine_id")
-                            failed_count += 1
-                            continue
-                        
-                        key = (request_id, machine_id)
-                        if key not in machine_map:
-                            # Try to find machine in any request (legacy support)
-                            machine_found = False
-                            for request in data['requests']:
-                                for machine in request.get('machines', []):
-                                    if machine['machineId'] == machine_id:
-                                        machine_map[key] = machine
-                                        machine_found = True
-                                        break
-                                if machine_found:
-                                    break
-                            
-                            if not machine_found:
-                                errors.append(f"Update {i}: Machine {machine_id} not found in request {request_id}")
+            with self._file_lock_context() as lock_acquired:
+                if not lock_acquired:
+                    logger.error("update_machines: could not acquire file lock")
+                    return {
+                        'success_count': 0,
+                        'failed_count': len(updates),
+                        'errors': ["Could not acquire file lock"]
+                    }
+
+                try:
+                    # Read inside the held file lock — no other process can write between
+                    # this read and the write below (mirrors add_machines_to_request).
+                    data = self._read_file_safe(self.db_file) or {"requests": []}
+
+                    # Group machines by request_id for faster lookup
+                    request_map = {}
+                    machine_map = {}
+                    for request in data['requests']:
+                        request_map[request['requestId']] = request
+                        for machine in request.get('machines', []):
+                            machine_map[(request['requestId'], machine['machineId'])] = machine
+
+                    # Process updates
+                    success_count = 0
+                    failed_count = 0
+                    errors = []
+
+                    for i, update in enumerate(updates):
+                        try:
+                            request_id = update.get('request_id')
+                            machine_id = update.get('machine_id')
+
+                            if not request_id or not machine_id:
+                                errors.append(f"Update {i}: Missing request_id or machine_id")
                                 failed_count += 1
                                 continue
-                        
-                        machine = machine_map[key]
-                        
-                        # Batch update all fields at once
-                        if 'status' in update and update['status'] is not None:
-                            machine['status'] = update['status']
-                        if 'result' in update and update['result'] is not None:
-                            machine['result'] = update['result']
-                        if 'message' in update and update['message'] is not None:
-                            machine['message'] = update['message']
-                        if 'return_id' in update and update['return_id'] is not None:
-                            machine['retId'] = update['return_id']
-                        
-                        # Batch update network info
-                        if 'private_ip' in update and update['private_ip'] is not None:
-                            machine['privateIpAddress'] = update['private_ip']
-                        if 'public_ip' in update and update['public_ip'] is not None:
-                            machine['publicIpAddress'] = update['public_ip']
-                        if 'public_dns' in update and update['public_dns'] is not None:
-                            machine['publicDnsName'] = update['public_dns']
-                        if 'name' in update and update['name'] is not None:
-                            machine['name'] = update['name']
-                        if 'lifecycle' in update and update['lifecycle'] is not None:
-                            machine['lifeCycleType'] = update['lifecycle']
-                        if 'tag_instance_id' in update and update['tag_instance_id'] is not None:
-                            machine['tagInstanceId'] = update['tag_instance_id']
-                        
-                        success_count += 1
-                        
-                    except Exception as e:
-                        errors.append(f"Update {i}: {str(e)}")
-                        failed_count += 1
-                
-                # Write back only if we have successful updates
-                if success_count > 0:
-                    self._write_data(data)
-                    logger.debug(f"Batch update completed: {success_count} successful, {failed_count} failed")
-                
-                return {
-                    'success_count': success_count,
-                    'failed_count': failed_count,
-                    'errors': errors[:10]
-                }
-                
-            except Exception as e:
-                logger.error(f"Error in update_machines: {e}")
-                return {
-                    'success_count': 0,
-                    'failed_count': len(updates),
-                    'errors': [str(e)]
-                }
+
+                            key = (request_id, machine_id)
+                            if key not in machine_map:
+                                # Try to find machine in any request (legacy support)
+                                machine_found = False
+                                for request in data['requests']:
+                                    for machine in request.get('machines', []):
+                                        if machine['machineId'] == machine_id:
+                                            machine_map[key] = machine
+                                            machine_found = True
+                                            break
+                                    if machine_found:
+                                        break
+
+                                if not machine_found:
+                                    errors.append(f"Update {i}: Machine {machine_id} not found in request {request_id}")
+                                    failed_count += 1
+                                    continue
+
+                            machine = machine_map[key]
+
+                            # Batch update all fields at once
+                            if 'status' in update and update['status'] is not None:
+                                machine['status'] = update['status']
+                            if 'result' in update and update['result'] is not None:
+                                machine['result'] = update['result']
+                            if 'message' in update and update['message'] is not None:
+                                machine['message'] = update['message']
+                            if 'return_id' in update and update['return_id'] is not None:
+                                machine['retId'] = update['return_id']
+
+                            # Batch update network info
+                            if 'private_ip' in update and update['private_ip'] is not None:
+                                machine['privateIpAddress'] = update['private_ip']
+                            if 'public_ip' in update and update['public_ip'] is not None:
+                                machine['publicIpAddress'] = update['public_ip']
+                            if 'public_dns' in update and update['public_dns'] is not None:
+                                machine['publicDnsName'] = update['public_dns']
+                            if 'name' in update and update['name'] is not None:
+                                machine['name'] = update['name']
+                            if 'lifecycle' in update and update['lifecycle'] is not None:
+                                machine['lifeCycleType'] = update['lifecycle']
+                            if 'tag_instance_id' in update and update['tag_instance_id'] is not None:
+                                machine['tagInstanceId'] = update['tag_instance_id']
+
+                            # Batch update CPU info
+                            if 'ncores' in update and update['ncores'] is not None:
+                                machine['ncores'] = update['ncores']
+                            if 'nthreads' in update and update['nthreads'] is not None:
+                                machine['nthreads'] = update['nthreads']
+
+                            success_count += 1
+
+                        except Exception as e:
+                            errors.append(f"Update {i}: {str(e)}")
+                            failed_count += 1
+
+                    # Write back only if we have successful updates
+                    if success_count > 0:
+                        self._atomic_write(self.db_file, data, backup=False)
+                        logger.debug(f"Batch update completed: {success_count} successful, {failed_count} failed")
+
+                    return {
+                        'success_count': success_count,
+                        'failed_count': failed_count,
+                        'errors': errors[:10]
+                    }
+
+                except Exception as e:
+                    logger.error(f"Error in update_machines: {e}")
+                    return {
+                        'success_count': 0,
+                        'failed_count': len(updates),
+                        'errors': [str(e)]
+                    }
 
     def remove_machine_from_request(self, request_id: str, machine_id: str) -> Tuple[bool, bool]:
         """
         Remove a machine from a request.
-        
+
+        The read and write are performed under a single file lock acquisition so
+        that concurrent callers in separate processes cannot interleave between
+        the read and the write (mirrors add_machines_to_request / update_machines).
+
         Returns: (machine_removed: bool, request_removed: bool)
         """
-        try:
-            data = self._read_data()
-            machine_removed = False
-            request_removed = False
-            
-            # Find the target request
-            target_request = None
-            request_index = -1
-            for i, request in enumerate(data.get('requests', [])):
-                if request['requestId'] == request_id:
-                    target_request = request
-                    request_index = i
-                    break
+        with self._lock:
+            with self._file_lock_context() as lock_acquired:
+                if not lock_acquired:
+                    logger.error("remove_machine_from_request: could not acquire file lock")
+                    return (False, False)
 
-            # Fallback for legacy instances
-            if not target_request:
-                for i, request in enumerate(data.get('requests', [])):
-                    for machine in request.get('machines', []):
-                        if machine['machineId'] == machine_id:
+                try:
+                    # Read inside the held file lock — no other process can write between
+                    # this read and the write below.
+                    data = self._read_file_safe(self.db_file) or {"requests": []}
+                    machine_removed = False
+                    request_removed = False
+
+                    # Find the target request
+                    target_request = None
+                    request_index = -1
+                    for i, request in enumerate(data.get('requests', [])):
+                        if request['requestId'] == request_id:
                             target_request = request
                             request_index = i
                             break
-                    if target_request:
-                        break
 
-            if not target_request:
-                logger.warning(f"Request {request_id} not found")
-                return (False, False)
-            
-            # Find the target machine
-            target_machine = None
-            machine_index = -1
-            for i, machine in enumerate(target_request.get('machines', [])):
-                if machine.get('machineId') == machine_id:
-                    target_machine = machine
-                    machine_index = i
-                    break
-            
-            if not target_machine:
-                logger.warning(f"Machine {machine_id} not found in request {request_id}")
-                return (False, False)
-            
-            # Check if machine can be removed
-            machine_status = target_machine.get('status', '')
-            removable_statuses = {'terminated', 'failed'}
-            
-            if machine_status not in removable_statuses:
-                logger.warning(f"Cannot remove machine {machine_id} - status is '{machine_status}', must be one of {removable_statuses}")
-                return (False, False)
-            
-            # Remove the machine
-            if machine_index >= 0:
-                target_request['machines'].pop(machine_index)
-                machine_removed = True
-            
-            # Check if request is now empty
-            if not target_request['machines']:
-                if request_index >= 0:
-                    data['requests'].pop(request_index)
-                    request_removed = True
-            
-            if machine_removed:
-                self._write_data(data)
-                logger.debug(f"Removed machine {machine_id} from request {request_id}")
-                if request_removed:
-                    logger.info(f"Removed empty request {request_id}")
-            
-            return (machine_removed, request_removed)
-            
-        except Exception as e:
-            logger.error(f"Error removing machine from request: {e}")
-            return (False, False)
+                    # Fallback for legacy instances
+                    if not target_request:
+                        for i, request in enumerate(data.get('requests', [])):
+                            for machine in request.get('machines', []):
+                                if machine['machineId'] == machine_id:
+                                    target_request = request
+                                    request_index = i
+                                    break
+                            if target_request:
+                                break
+
+                    if not target_request:
+                        logger.warning(f"Request {request_id} not found")
+                        return (False, False)
+
+                    # Find the target machine
+                    target_machine = None
+                    machine_index = -1
+                    for i, machine in enumerate(target_request.get('machines', [])):
+                        if machine.get('machineId') == machine_id:
+                            target_machine = machine
+                            machine_index = i
+                            break
+
+                    if not target_machine:
+                        logger.warning(f"Machine {machine_id} not found in request {request_id}")
+                        return (False, False)
+
+                    # Check if machine can be removed
+                    machine_status = target_machine.get('status', '')
+                    removable_statuses = {'terminated', 'failed'}
+
+                    if machine_status not in removable_statuses:
+                        logger.warning(f"Cannot remove machine {machine_id} - status is '{machine_status}', must be one of {removable_statuses}")
+                        return (False, False)
+
+                    # Remove the machine
+                    if machine_index >= 0:
+                        target_request['machines'].pop(machine_index)
+                        machine_removed = True
+
+                    # Check if request is now empty
+                    if not target_request['machines']:
+                        if request_index >= 0:
+                            data['requests'].pop(request_index)
+                            request_removed = True
+
+                    if machine_removed:
+                        self._atomic_write(self.db_file, data, backup=False)
+                        logger.debug(f"Removed machine {machine_id} from request {request_id}")
+                        if request_removed:
+                            logger.info(f"Removed empty request {request_id}")
+
+                    return (machine_removed, request_removed)
+
+                except Exception as e:
+                    logger.error(f"Error removing machine from request: {e}")
+                    return (False, False)
 
 
     def get_request_for_machine(self, machine_id: str) -> Dict[str, Any]:
@@ -750,8 +777,8 @@ class DBManager:
                 original_count = len(request.get('machines', []))
                 if original_count > 0:
                     request['machines'] = [
-                        machine for machine in request['machines'] 
-                        if machine.get('status') != 'terminated'
+                        machine for machine in request['machines']
+                        if not (machine.get('status') == 'terminated' and machine.get('retId'))
                     ]
                     stats['terminated_machines_removed'] += (original_count - len(request['machines']))
                 

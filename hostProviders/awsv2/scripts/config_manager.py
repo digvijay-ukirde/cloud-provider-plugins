@@ -206,22 +206,15 @@ class ConfigManager:
             
             return None
     
-    def _is_script_result_expired(self, cache_entry: Dict) -> bool:
-        """Check if cached script result is expired"""
-        current_time = time.time()
-        if cache_entry['expiry']:
-            return current_time >= cache_entry['expiry'] - 300  # 5-minute buffer
-        else:
-            return current_time - cache_entry['timestamp'] >= 300  # 5-minute cache for non-expiring
-    
     def _get_credentials_from_script(self, script_path: str) -> Dict[str, str]:
         """Execute credential script with caching and expiration handling"""
         try:
-            # Check if script output is cached
+            # Check if script output is cached — _get_cached_script_result returns
+            # None when the entry is absent or expired, so no second expiry check needed.
             script_hash = self._get_script_hash(script_path)
             cached_result = self._get_cached_script_result(script_hash)
-            
-            if cached_result and not self._is_script_result_expired(cached_result):
+
+            if cached_result:
                 logger.debug(f"Using cached credentials from script: {script_path}")
                 return cached_result['credentials']
             

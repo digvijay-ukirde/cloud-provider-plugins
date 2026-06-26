@@ -14,8 +14,8 @@
 
 from typing import Dict, List, Any
 from aws_client import AWSClient
-from contextlib import contextmanager
 from template_manager import TemplateManager
+from contextlib import contextmanager
 import logging
 
 logger = logging.getLogger(__name__)
@@ -51,8 +51,7 @@ class RequestManager:
         template_manager = TemplateManager()
         template = template_manager.get_template(template_id)
         
-        with self.aws_client.resource_context():
-            request_id = self.aws_client.request_machines(template, count, rc_account)
+        request_id = self.aws_client.request_machines(template, count, rc_account)
         
         return {
             "requestId": request_id,
@@ -62,11 +61,7 @@ class RequestManager:
     def request_return_machines(self, machines: List[Dict[str, str]]) -> Dict[str, Any]:
         """Request to terminate machines using multithreading"""
         instance_ids = [machine['machineId'] for machine in machines]
-        
-        # Use context manager to ensure proper cleanup
-        with self.aws_client.resource_context():
-            request_id = self.aws_client.request_return_machines(instance_ids)
-        
+        request_id = self.aws_client.request_return_machines(instance_ids)
         return {
             "requestId": request_id,
             "message": "Request to terminate instances successful."
@@ -75,7 +70,6 @@ class RequestManager:
     def get_request_status(self, request_ids: List[str]) -> Dict[str, Any]:
         """Get status of requests"""
         requests = []
-        
         for request_id in request_ids:
             result = self.aws_client.get_request_status(request_id)
             requests.append({
@@ -84,16 +78,11 @@ class RequestManager:
                 "machines": result['machines'],
                 "message": result['message']
             })
-        
         return {"requests": requests}
 
     def get_return_requests(self, machines: List[Dict[str, str]]) -> Dict[str, Any]:
         """Check for terminated instances by reading from database and AWS"""
-        
-        # Use context manager to ensure proper cleanup
-        with self.aws_client.resource_context():
-            result = self.aws_client.get_return_requests(machines)
-    
+        result = self.aws_client.get_return_requests(machines)
         return {
             "requests": result['requests'],
             "status": result['status'],

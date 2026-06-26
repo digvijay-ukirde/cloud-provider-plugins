@@ -55,10 +55,10 @@ def read_json(input_file):
         return json.load(f)
     
 def read_input_json():
-    """Read input JSON from file specified with -f option"""
-    if len(sys.argv) != 2:
-        raise ValueError("Usage: script.py -f <input.json>")
-    
+    """Read input JSON from file"""
+    if len(sys.argv) != 3:
+        raise ValueError("Usage: script.py <input.json> <homeDir>")
+
     input_file = sys.argv[1]
     if not os.path.exists(input_file):
         raise FileNotFoundError(f"Input file not found: {input_file}")
